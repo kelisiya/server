@@ -27,27 +27,30 @@
 
 import argparse
 import logging
+import os
 import os.path
 import multiprocessing
 import pathlib
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import traceback
-from distutils.dir_util import copy_tree
 from inspect import getsourcefile
 
 #
 # Build Triton Inference Server.
 #
 
-# By default build.py builds the Triton container. The TRITON_VERSION
-# file indicates the Triton version and TRITON_VERSION_MAP is used to
-# determine the corresponding container version and upstream container
-# version (upstream containers are dependencies required by
-# Triton). These versions may be overridden. See docs/build.md for
-# more information.
+# By default build.py builds the Triton Docker image, but can also be
+# used to build without Docker.  See docs/build.md and --help for more
+# infomation.
+#
+# The TRITON_VERSION file indicates the Triton version and
+# TRITON_VERSION_MAP is used to determine the corresponding container
+# version and upstream container version (upstream containers are
+# dependencies required by Triton). These versions may be overridden.
 
 # Map from Triton version to corresponding container and component versions.
 #
@@ -152,16 +155,6 @@ def mkdir(path):
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def rmdir(path):
-    log_verbose('rmdir: {}'.format(path))
-    shutil.rmtree(path, ignore_errors=True)
-
-
-def cpdir(src, dest):
-    log_verbose('cpdir: {} -> {}'.format(src, dest))
-    copy_tree(src, dest, preserve_symlinks=1)
-
-
 def untar(targetdir, tarfile):
     log_verbose('untar {} into {}'.format(tarfile, targetdir))
     p = subprocess.Popen(['tar', '--strip-components=1', '-xf', tarfile],
@@ -171,96 +164,117 @@ def untar(targetdir, tarfile):
             'untar {} into {} failed'.format(tarfile, targetdir))
 
 
-def gitclone(cwd, repo, tag, subdir, org):
-    # If 'tag' starts with "pull/" then it must be of form
-    # "pull/<pr>/head". We just clone at "main" and then fetch the
-    # reference onto a new branch we name "tritonbuildref".
-    clone_dir = cwd + '/' + subdir
-    if tag.startswith("pull/"):
-        log_verbose('git clone of repo "{}" at ref "{}"'.format(repo, tag))
-
-        if os.path.exists(clone_dir) and not FLAGS.no_force_clone:
-            rmdir(clone_dir)
-
-        if not os.path.exists(clone_dir):
-            p = subprocess.Popen([
-                'git', 'clone', '--recursive', '--depth=1', '{}/{}.git'.format(
-                    org, repo), subdir
-            ],
-                                 cwd=cwd)
-            p.wait()
-            fail_if(
-                p.returncode != 0,
-                'git clone of repo "{}" at branch "main" failed'.format(repo))
-
-            log_verbose('git fetch of ref "{}"'.format(tag))
-            p = subprocess.Popen(
-                ['git', 'fetch', 'origin', '{}:tritonbuildref'.format(tag)],
-                cwd=os.path.join(cwd, subdir))
-            p.wait()
-            fail_if(p.returncode != 0,
-                    'git fetch of ref "{}" failed'.format(tag))
-
-            log_verbose('git checkout of tritonbuildref')
-            p = subprocess.Popen(['git', 'checkout', 'tritonbuildref'],
-                                 cwd=os.path.join(cwd, subdir))
-            p.wait()
-            fail_if(p.returncode != 0,
-                    'git checkout of branch "tritonbuildref" failed')
-
-    else:
-        log_verbose('git clone of repo "{}" at tag "{}"'.format(repo, tag))
-
-        if os.path.exists(clone_dir) and not FLAGS.no_force_clone:
-            rmdir(clone_dir)
-
-        if not os.path.exists(clone_dir):
-            p = subprocess.Popen([
-                'git', 'clone', '--recursive', '--single-branch', '--depth=1',
-                '-b', tag, '{}/{}.git'.format(org, repo), subdir
-            ],
-                                 cwd=cwd)
-            p.wait()
-            fail_if(
-                p.returncode != 0,
-                'git clone of repo "{}" at tag "{}" failed'.format(repo, tag))
-
-
 def prebuild_command():
     p = subprocess.Popen(FLAGS.container_prebuild_command.split())
     p.wait()
     fail_if(p.returncode != 0, 'container prebuild cmd failed')
 
 
-def cmake(cwd, args):
-    log_verbose('cmake {}'.format(args))
-    p = subprocess.Popen([
-        'cmake',
-    ] + args, cwd=cwd)
-    p.wait()
-    fail_if(p.returncode != 0, 'cmake failed')
+class BuildScript:
+    """Utility class for writing build scripts"""
 
+    def __init__(self, filepath, desc=None, verbose=False):
+        self._filepath = filepath
+        self._file = open(filepath, "w")
+        self._verbose = verbose
+        self.header(desc)
 
-def makeinstall(cwd, target='install'):
-    log_verbose('make {}'.format(target))
+    def __enter__(self):
+        return self
 
-    if target_platform() == 'windows':
-        verbose_flag = '' if FLAGS.verbose else '-clp:ErrorsOnly'
-        buildtype_flag = '-p:Configuration={}'.format(FLAGS.build_type)
-        p = subprocess.Popen([
-            'msbuild.exe', '-m:{}'.format(str(FLAGS.build_parallel)),
-            verbose_flag, buildtype_flag, '{}.vcxproj'.format(target)
-        ],
-                             cwd=cwd)
-    else:
-        verbose_flag = 'VERBOSE=1' if FLAGS.verbose else 'VERBOSE=0'
-        p = subprocess.Popen(
-            ['make', '-j',
-             str(FLAGS.build_parallel), verbose_flag, target],
-            cwd=cwd)
+    def __exit__(self, type, value, traceback):
+        self.close()
 
-    p.wait()
-    fail_if(p.returncode != 0, 'make {} failed'.format(target))
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        """Close the file"""
+        self._file.close()
+        st = os.stat(self._filepath)
+        os.chmod(self._filepath, st.st_mode | stat.S_IEXEC)
+
+    def blankln(self):
+        self._file.write('\n')
+
+    def commentln(self, cnt):
+        self._file.write('#' * cnt + '\n')
+
+    def comment(self, msg=''):
+        if not isinstance(msg, str):
+            try:
+                for m in msg:
+                    self._file.write(f'# {msg}\n')
+                return
+            except TypeError:
+                pass
+
+        self._file.write(f'# {msg}\n')
+
+    def comment_verbose(self, msg=''):
+        if self._verbose:
+            self.comment(msg)
+
+    def header(self, desc=None):
+        self._file.write('#!/usr/bin/env bash\n\n')
+        if desc is not None:
+            self.comment()
+            self.comment(desc)
+            self.comment()
+            self.blankln()
+
+        self.comment('Exit script immediately if any command fails')
+        self._file.write('set -e\n\n')
+
+    def cwd(self, path):
+        self._file.write(f'cd {path}\n')
+
+    def mkdir(self, path):
+        self._file.write(f'mkdir -p {pathlib.Path(path)}\n')
+
+    def rmdir(self, path):
+        self._file.write(f'rm -fr {pathlib.Path(path)}\n')
+
+    def cpdir(self, src, dest):
+        self._file.write(f'cp -r {src} {dest}\n')
+
+    def cmake(self, args):
+        self._file.write(f'cmake {" ".join(args)}\n')
+
+    def makeinstall(self, target='install'):
+        if target_platform() == 'windows':
+            verbose_flag = '' if FLAGS.verbose else '-clp:ErrorsOnly'
+            self._file.write(
+                f'msbuild.exe -m:{FLAGS.build_parallel} {verbose_flag} -p:Configuration={buildtype_flag} {target}.vcxproj\n'
+            )
+        else:
+            verbose_flag = 'VERBOSE=1' if FLAGS.verbose else 'VERBOSE=0'
+            self._file.write(
+                f'make -j{FLAGS.build_parallel} {verbose_flag} {target}\n')
+
+    def gitclone(self, repo, tag, subdir, org):
+        clone_dir = subdir
+        if not FLAGS.no_force_clone:
+            self.rmdir(clone_dir)
+
+        # If 'tag' starts with "pull/" then it must be of form
+        # "pull/<pr>/head". We just clone at "main" and then fetch the
+        # reference onto a new branch we name "tritonbuildref".
+        if tag.startswith("pull/"):
+            self._file.write(f'if [[ ! -e {clone_dir} ]]; then\n')
+            self._file.write(
+                f'  git clone --recursive --depth=1 {org}/{repo}.git {subdir};\n'
+            )
+            self._file.write(f'fi\n')
+            self.cwd(subdir)
+            self._file.write(f'git fetch origin {tag}:tritonbuildref\n')
+            self._file.write(f'git checkout tritonbuildref\n')
+        else:
+            self._file.write(f'if [[ ! -e {clone_dir} ]]; then\n')
+            self._file.write(
+                f'  git clone --recursive --single-branch --depth=1 -b {tag} {org}/{repo}.git {subdir};\n'
+            )
+            self._file.write(f'fi\n')
 
 
 def cmake_core_arg(name, type, value):
@@ -1475,6 +1489,7 @@ def container_build(images, backends, repoagents, endpoints):
 
 
 def build_backend(be,
+                  cmake_script,
                   tag,
                   build_dir,
                   install_dir,
@@ -1486,19 +1501,30 @@ def build_backend(be,
     repo_build_dir = os.path.join(build_dir, be, 'build')
     repo_install_dir = os.path.join(build_dir, be, 'install')
 
-    mkdir(build_dir)
-    gitclone(build_dir, backend_repo(be), tag, be, github_organization)
-    mkdir(repo_build_dir)
-    cmake(
-        repo_build_dir,
+    cmake_script.commentln(8)
+    cmake_script.comment(f'\'{be}\' backend')
+    cmake_script.comment('Delete this section to remove backend from build')
+    cmake_script.comment()
+    cmake_script.mkdir(build_dir)
+    cmake_script.cwd(build_dir)
+    cmake_script.gitclone(backend_repo(be), tag, be, github_organization)
+
+    cmake_script.mkdir(repo_build_dir)
+    cmake_script.cwd(repo_build_dir)
+    cmake_script.cmake(
         backend_cmake_args(images, components, be, repo_install_dir,
                            library_paths, variant_index))
-    makeinstall(repo_build_dir)
+    cmake_script.makeinstall()
 
     backend_install_dir = os.path.join(install_dir, 'backends', be)
-    rmdir(backend_install_dir)
-    mkdir(backend_install_dir)
-    cpdir(os.path.join(repo_install_dir, 'backends', be), backend_install_dir)
+    cmake_script.rmdir(backend_install_dir)
+    cmake_script.mkdir(backend_install_dir)
+    cmake_script.cpdir(os.path.join(repo_install_dir, 'backends', be),
+                       backend_install_dir)
+    cmake_script.comment()
+    cmake_script.comment(f'end \'{be}\' backend')
+    cmake_script.commentln(8)
+    cmake_script.blankln()
 
 
 def get_tagged_backend(be, version):
@@ -1528,6 +1554,11 @@ if __name__ == '__main__':
                           required=False,
                           help='Enable verbose output.')
 
+    parser.add_argument(
+        '--dryrun',
+        action="store_true",
+        required=False,
+        help='Output the build scripts, but do not perform build.')
     parser.add_argument('--no-container-build',
                         action="store_true",
                         required=False,
@@ -1824,6 +1855,9 @@ if __name__ == '__main__':
         with open(os.path.join(SCRIPT_DIR, 'TRITON_VERSION'), "r") as vfile:
             FLAGS.version = vfile.readline().strip()
 
+    if FLAGS.build_parallel is None:
+        FLAGS.build_parallel = multiprocessing.cpu_count() * 2
+
     log('Building Triton Inference Server')
     log('platform {}'.format(target_platform()))
     log('machine {}'.format(target_machine()))
@@ -1961,7 +1995,6 @@ if __name__ == '__main__':
     # tritonserver container holding the results of the build.
     if not FLAGS.no_container_build:
         import docker
-
         container_build(images, backends, repoagents, FLAGS.endpoint)
         sys.exit(0)
 
@@ -1970,9 +2003,6 @@ if __name__ == '__main__':
     # pre-build command.
     if (FLAGS.container_prebuild_command):
         prebuild_command()
-
-    if FLAGS.build_parallel is None:
-        FLAGS.build_parallel = multiprocessing.cpu_count() * 2
 
     # Initialize map of common components and repo-tag for each.
     components = {
@@ -1994,71 +2024,108 @@ if __name__ == '__main__':
     for c in components:
         log('component "{}" at tag/branch "{}"'.format(c, components[c]))
 
-    # Build the core shared library and the server executable.
-    if not FLAGS.no_core_build:
-        repo_build_dir = os.path.join(FLAGS.build_dir, 'tritonserver', 'build')
-        repo_install_dir = os.path.join(FLAGS.build_dir, 'tritonserver',
-                                        'install')
+    # Write the build script that invokes cmake for the core, backends, and repo-agents.
+    with BuildScript(
+            os.path.join(FLAGS.build_dir, 'cmake_script'),
+            verbose=FLAGS.verbose,
+            desc=('Build script for Triton Inference Server')) as cmake_script:
 
-        mkdir(repo_build_dir)
-        cmake(repo_build_dir,
-              core_cmake_args(components, backends, repo_install_dir))
-        makeinstall(repo_build_dir)
+        # Commands to build the core shared library and the server executable.
+        if not FLAGS.no_core_build:
+            repo_build_dir = os.path.join(FLAGS.build_dir, 'tritonserver',
+                                          'build')
+            repo_install_dir = os.path.join(FLAGS.build_dir, 'tritonserver',
+                                            'install')
 
-        core_install_dir = FLAGS.install_dir
-        mkdir(core_install_dir)
-        cpdir(repo_install_dir, core_install_dir)
+            cmake_script.commentln(8)
+            cmake_script.comment(
+                'Triton core library and tritonserver executable')
+            cmake_script.comment()
+            cmake_script.mkdir(repo_build_dir)
+            cmake_script.cwd(repo_build_dir)
+            cmake_script.cmake(
+                core_cmake_args(components, backends, repo_install_dir))
+            cmake_script.makeinstall()
 
-    # Build each backend...
-    for be in backends:
-        # Core backends are not built separately from core so skip...
-        if (be in CORE_BACKENDS):
-            continue
+            core_install_dir = FLAGS.install_dir
+            cmake_script.mkdir(core_install_dir)
+            cmake_script.cpdir(repo_install_dir, core_install_dir)
+            cmake_script.comment()
+            cmake_script.comment('end Triton core library and tritonserver executable')
+            cmake_script.commentln(8)
+            cmake_script.blankln()
 
-        tagged_be_list = []
-        if (be == 'openvino'):
-            tagged_be_list.append(
-                get_tagged_backend(be, TRITON_VERSION_MAP[FLAGS.version][4][0]))
-            if (FLAGS.build_multiple_openvino):
-                skip = True
-                for ver in TRITON_VERSION_MAP[FLAGS.version][4]:
-                    if not skip:
-                        tagged_be_list.append(get_tagged_backend(be, ver))
-                    skip = False
-        # If armnn_tflite backend, source from external repo for git clone
-        if be == 'armnn_tflite':
-            github_organization = 'https://gitlab.com/arm-research/smarter/'
-        else:
-            github_organization = FLAGS.github_organization
+        # Commands to build each backend...
+        for be in backends:
+            # Core backends are not built separately from core so skip...
+            if (be in CORE_BACKENDS):
+                continue
 
-        if not tagged_be_list:
-            build_backend(be, backends[be], FLAGS.build_dir, FLAGS.install_dir,
-                          github_organization, images, components,
-                          library_paths)
-        else:
-            variant_index = 0
-            for tagged_be in tagged_be_list:
-                build_backend(tagged_be, backends[be], FLAGS.build_dir,
+            tagged_be_list = []
+            if (be == 'openvino'):
+                tagged_be_list.append(
+                    get_tagged_backend(be,
+                                       TRITON_VERSION_MAP[FLAGS.version][4][0]))
+                if (FLAGS.build_multiple_openvino):
+                    skip = True
+                    for ver in TRITON_VERSION_MAP[FLAGS.version][4]:
+                        if not skip:
+                            tagged_be_list.append(get_tagged_backend(be, ver))
+                        skip = False
+
+            # If armnn_tflite backend, source from external repo for git clone
+            if be == 'armnn_tflite':
+                github_organization = 'https://gitlab.com/arm-research/smarter/'
+            else:
+                github_organization = FLAGS.github_organization
+
+            if not tagged_be_list:
+                build_backend(be, cmake_script, backends[be], FLAGS.build_dir,
                               FLAGS.install_dir, github_organization, images,
-                              components, library_paths, variant_index)
-                variant_index += 1
+                              components, library_paths)
+            else:
+                variant_index = 0
+                for tagged_be in tagged_be_list:
+                    build_backend(tagged_be, cmake_script, backends[be],
+                                  FLAGS.build_dir, FLAGS.install_dir,
+                                  github_organization, images, components,
+                                  library_paths, variant_index)
+                    variant_index += 1
 
-    # Build each repo agent...
-    for ra in repoagents:
-        repo_build_dir = os.path.join(FLAGS.build_dir, ra, 'build')
-        repo_install_dir = os.path.join(FLAGS.build_dir, ra, 'install')
+        # Commands to build each repo agent...
+        for ra in repoagents:
+            repo_build_dir = os.path.join(FLAGS.build_dir, ra, 'build')
+            repo_install_dir = os.path.join(FLAGS.build_dir, ra, 'install')
 
-        mkdir(FLAGS.build_dir)
-        gitclone(FLAGS.build_dir, repoagent_repo(ra), repoagents[ra], ra,
-                 FLAGS.github_organization)
-        mkdir(repo_build_dir)
-        cmake(repo_build_dir,
-              repoagent_cmake_args(images, components, ra, repo_install_dir))
-        makeinstall(repo_build_dir)
+            cmake_script.commentln(8)
+            cmake_script.comment(f'\'{ra}\' repository agent')
+            cmake_script.comment(
+                'Delete this section to remove repository agent from build')
+            cmake_script.comment()
+            cmake_script.mkdir(FLAGS.build_dir)
+            cmake_script.cwd(FLAGS.build_dir)
+            cmake_script.gitclone(repoagent_repo(ra), repoagents[ra], ra,
+                                  FLAGS.github_organization)
 
-        repoagent_install_dir = os.path.join(FLAGS.install_dir, 'repoagents',
-                                             ra)
-        rmdir(repoagent_install_dir)
-        mkdir(repoagent_install_dir)
-        cpdir(os.path.join(repo_install_dir, 'repoagents', ra),
-              repoagent_install_dir)
+            cmake_script.mkdir(repo_build_dir)
+            cmake_script.cwd(repo_build_dir)
+            cmake_script.cmake(
+                repoagent_cmake_args(images, components, ra, repo_install_dir))
+            cmake_script.makeinstall()
+
+            repoagent_install_dir = os.path.join(FLAGS.install_dir,
+                                                 'repoagents', ra)
+            cmake_script.rmdir(repoagent_install_dir)
+            cmake_script.mkdir(repoagent_install_dir)
+            cmake_script.cpdir(os.path.join(repo_install_dir, 'repoagents', ra),
+                               repoagent_install_dir)
+            cmake_script.comment()
+            cmake_script.comment(f'end \'{ra}\' repository agent')
+            cmake_script.commentln(8)
+            cmake_script.blankln()
+
+    # In not dry-run, execute the script to perform the build...
+    if not FLAGS.dryrun:
+        p = subprocess.Popen(['./cmake_script'], cwd=FLAGS.build_dir)
+        p.wait()
+        fail_if(p.returncode != 0, 'build failed')
