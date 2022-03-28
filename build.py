@@ -106,13 +106,16 @@ NONCORE_BACKENDS = [
     'openvino', 'fil', 'fastertransformer', 'tensorrt', 'armnn_tflite'
 ]
 EXAMPLE_REPOAGENTS = ['checksum']
+
 FLAGS = None
 EXTRA_CORE_CMAKE_FLAGS = {}
 OVERRIDE_CORE_CMAKE_FLAGS = {}
 EXTRA_BACKEND_CMAKE_FLAGS = {}
 OVERRIDE_BACKEND_CMAKE_FLAGS = {}
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(getsourcefile(lambda: 0)))
+THIS_SCRIPT_DIR = os.path.dirname(os.path.abspath(getsourcefile(lambda: 0)))
+CMAKE_SCRIPT_NAME = 'cmake_build'
+DOCKER_SCRIPT_NAME = 'docker_build'
 
 
 def log(msg, force=False):
@@ -132,6 +135,12 @@ def fail(msg):
     fail_if(True, msg)
 
 
+def fail_if(p, msg):
+    if p:
+        print('error: {}'.format(msg), file=sys.stderr)
+        sys.exit(1)
+
+
 def target_platform():
     if FLAGS.target_platform is not None:
         return FLAGS.target_platform
@@ -144,10 +153,28 @@ def target_machine():
     return platform.machine().lower()
 
 
-def fail_if(p, msg):
-    if p:
-        print('error: {}'.format(msg), file=sys.stderr)
-        sys.exit(1)
+def tagged_backend(be, version):
+    tagged_be = be
+    if be == 'openvino':
+        if version[0] == 'SPECIFIC':
+            tagged_be += "_" + version[1]
+        else:
+            tagged_be += "_" + version[0].replace('.', '_')
+            if version[1] and target_platform() != 'windows':
+                tagged_be += "_pre"
+    return tagged_be
+
+
+def container_versions(version, container_version, upstream_container_version):
+    if container_version is None:
+        if version not in TRITON_VERSION_MAP:
+            fail('container version not known for {}'.format(version))
+        container_version = TRITON_VERSION_MAP[version][0]
+    if upstream_container_version is None:
+        if version not in TRITON_VERSION_MAP:
+            fail('upstream container version not known for {}'.format(version))
+        upstream_container_version = TRITON_VERSION_MAP[version][1]
+    return container_version, upstream_container_version
 
 
 def mkdir(path):
@@ -208,7 +235,6 @@ class BuildScript:
                 return
             except TypeError:
                 pass
-
         self._file.write(f'# {msg}\n')
 
     def comment_verbose(self, msg=''):
@@ -222,12 +248,25 @@ class BuildScript:
             self.comment(desc)
             self.comment()
             self.blankln()
-
         self.comment('Exit script immediately if any command fails')
         self._file.write('set -e\n\n')
 
+    def cmd(self, clist):
+        if not isinstance(clist, str):
+            try:
+                for c in clist:
+                    self._file.write(f'{c} ')
+                self._file.write('\n')
+                return
+            except TypeError:
+                pass
+        self._file.write(f'{clist}\n')
+
     def cwd(self, path):
         self._file.write(f'cd {path}\n')
+
+    def cp(self, src, dest):
+        self._file.write(f'cp {src} {dest}\n')
 
     def mkdir(self, path):
         self._file.write(f'mkdir -p {pathlib.Path(path)}\n')
@@ -778,19 +817,6 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86
 '''.format(dcgm_version, dcgm_version)
 
 
-def get_container_versions(version, container_version,
-                           upstream_container_version):
-    if container_version is None:
-        if version not in TRITON_VERSION_MAP:
-            fail('container version not known for {}'.format(version))
-        container_version = TRITON_VERSION_MAP[version][0]
-    if upstream_container_version is None:
-        if version not in TRITON_VERSION_MAP:
-            fail('upstream container version not known for {}'.format(version))
-        upstream_container_version = TRITON_VERSION_MAP[version][1]
-    return container_version, upstream_container_version
-
-
 def create_dockerfile_buildbase(ddir, dockerfile_name, argmap):
     df = '''
 ARG TRITON_VERSION={}
@@ -886,8 +912,16 @@ ENTRYPOINT []
 ENV TRITON_SERVER_VERSION ${TRITON_VERSION}
 ENV NVIDIA_TRITON_SERVER_VERSION ${TRITON_CONTAINER_VERSION}
 '''
+    # Need TRITONBUILD_* version of some envvars so that they are
+    # passed into cmake commands run inside this image.
+    benv = ['TRT_VERSION', 'DALI_VERSION']
+    if target_platform() == 'windows':
+        benv += ['CMAKE_TOOLCHAIN_FILE', 'VCPKG_TARGET_TRIPLET']
+    for k in benv:
+        df += '''
+ENV TRITONBUILD_{0} ${{{0}}}
+'''.format(k)
 
-    mkdir(ddir)
     with open(os.path.join(ddir, dockerfile_name), "w") as dfile:
         dfile.write(df)
 
@@ -921,7 +955,6 @@ RUN if [ -d {0}/onnxruntime ]; then \
     fi
 '''.format(build_dir)
 
-    mkdir(ddir)
     with open(os.path.join(ddir, dockerfile_name), "w") as dfile:
         dfile.write(df)
 
@@ -1011,7 +1044,6 @@ COPY --chown=1000:1000 --from=tritonserver_build {0}/install/backends backends
 COPY --chown=1000:1000 --from=tritonserver_build {0}/install/repoagents repoagents
 '''.format(build_dir)
 
-    mkdir(ddir)
     with open(os.path.join(ddir, dockerfile_name), "w") as dfile:
         dfile.write(df)
 
@@ -1221,7 +1253,6 @@ LABEL com.nvidia.build.ref={}
 '''.format(argmap['NVIDIA_BUILD_ID'], argmap['NVIDIA_BUILD_ID'],
            argmap['NVIDIA_BUILD_REF'])
 
-    mkdir(ddir)
     with open(os.path.join(ddir, dockerfile_name), "w") as dfile:
         dfile.write(df)
 
@@ -1488,7 +1519,135 @@ def container_build(images, backends, repoagents, endpoints):
         fail('container build failed')
 
 
-def build_backend(be,
+def create_build_dockerfiles(images, backends, repoagents, endpoints):
+    # The cmake, build and install directories within the container.
+    # Windows uses "\" for the path separator but Docker expects "/"
+    # (unix style) separator. We use replace to fix the path for docker usage.
+    build_dir = os.path.join(FLAGS.tmp_dir, 'tritonbuild').replace("\\", "/")
+    install_dir = os.path.join(build_dir, 'install')
+    if target_platform() == 'windows':
+        install_dir = os.path.normpath(install_dir)
+        cmake_dir = os.path.normpath('c:/workspace')
+    else:
+        cmake_dir = '/workspace'
+
+    if 'base' in images:
+        base_image = images['base']
+    elif target_platform() == 'windows':
+        base_image = 'mcr.microsoft.com/dotnet/framework/sdk:4.8'
+    elif FLAGS.enable_gpu:
+        base_image = 'nvcr.io/nvidia/tritonserver:{}-py3-min'.format(
+            FLAGS.upstream_container_version)
+    else:
+        base_image = 'ubuntu:20.04'
+
+    dockerfileargmap = {
+        'NVIDIA_BUILD_REF':
+            '' if FLAGS.build_sha is None else FLAGS.build_sha,
+        'NVIDIA_BUILD_ID':
+            '<unknown>' if FLAGS.build_id is None else FLAGS.build_id,
+        'TRITON_VERSION':
+            FLAGS.version,
+        'TRITON_CONTAINER_VERSION':
+            FLAGS.container_version,
+        'BASE_IMAGE':
+            base_image,
+        'DCGM_VERSION':
+            '' if FLAGS.version is None or FLAGS.version
+            not in TRITON_VERSION_MAP else TRITON_VERSION_MAP[FLAGS.version][5],
+    }
+
+    # For cpu-only image we need to copy some cuda libraries and dependencies
+    # since we are using a PyTorch container that is not CPU-only
+    if not FLAGS.enable_gpu and ('pytorch' in backends) and \
+            (target_platform() != 'windows'):
+        dockerfileargmap[
+            'GPU_BASE_IMAGE'] = 'nvcr.io/nvidia/tritonserver:{}-py3-min'.format(
+                FLAGS.upstream_container_version)
+
+    create_dockerfile_buildbase(FLAGS.build_dir, 'Dockerfile.buildbase',
+                                dockerfileargmap)
+    create_dockerfile_build(FLAGS.build_dir, 'Dockerfile.build', backends,
+                            build_dir)
+
+    if target_platform() == 'windows':
+        create_dockerfile_windows(FLAGS.build_dir, 'Dockerfile',
+                                  dockerfileargmap, backends, repoagents,
+                                  build_dir)
+    else:
+        create_dockerfile_linux(FLAGS.build_dir, 'Dockerfile', dockerfileargmap,
+                                backends, repoagents, endpoints, build_dir)
+
+
+def create_docker_build_script():
+    with BuildScript(
+            os.path.join(FLAGS.build_dir, DOCKER_SCRIPT_NAME),
+            verbose=FLAGS.verbose,
+            desc=('Docker-based build script for Triton Inference Server'
+                 )) as docker_script:
+
+        # Build the tritonserver_buildbase image.
+        cachefrommap = [
+            'tritonserver_buildbase', 'tritonserver_buildbase_cache0',
+            'tritonserver_buildbase_cache1'
+        ]
+
+        baseargs = [
+            'docker', 'build', '-t', 'tritonserver_buildbase', '-f',
+            os.path.join(FLAGS.build_dir, 'Dockerfile.buildbase')
+        ]
+
+        if not FLAGS.no_container_pull:
+            baseargs += [
+                '--pull',
+            ]
+
+        # Windows docker runs in a VM and memory needs to be specified
+        # explicitly.
+        if target_platform() == 'windows':
+            baseargs += ['--memory', FLAGS.container_memory]
+
+        baseargs += ['--cache-from={}'.format(k) for k in cachefrommap]
+        baseargs += ['.']
+
+        docker_script.cwd(THIS_SCRIPT_DIR)
+        docker_script.cmd(baseargs)
+
+
+def core_build(cmake_script, build_dir, install_dir, components, backends):
+    repo_build_dir = os.path.join(build_dir, 'tritonserver', 'build')
+    repo_install_dir = os.path.join(build_dir, 'tritonserver', 'install')
+
+    cmake_script.commentln(8)
+    cmake_script.comment('Triton core library and tritonserver executable')
+    cmake_script.comment()
+    cmake_script.mkdir(repo_build_dir)
+    cmake_script.cwd(repo_build_dir)
+    cmake_script.cmake(core_cmake_args(components, backends, repo_install_dir))
+    cmake_script.makeinstall()
+
+    cmake_script.mkdir(os.path.join(install_dir, 'bin'))
+    cmake_script.cp(os.path.join(repo_install_dir, 'bin', 'tritonserver'),
+                    os.path.join(install_dir, 'bin'))
+    cmake_script.mkdir(os.path.join(install_dir, 'lib'))
+    cmake_script.cp(os.path.join(repo_install_dir, 'lib', 'libtritonserver.so'),
+                    os.path.join(install_dir, 'lib'))
+    cmake_script.mkdir(os.path.join(install_dir, 'include', 'triton'))
+    cmake_script.cpdir(
+        os.path.join(repo_install_dir, 'include', 'triton', 'core'),
+        os.path.join(install_dir, 'include', 'triton', 'core'))
+
+    cmake_script.cp(os.path.join(THIS_SCRIPT_DIR, 'LICENSE'), install_dir)
+    cmake_script.cp(os.path.join(THIS_SCRIPT_DIR, 'TRITON_VERSION'),
+                    install_dir)
+
+    cmake_script.comment()
+    cmake_script.comment('end Triton core library and tritonserver executable')
+    cmake_script.commentln(8)
+    cmake_script.blankln()
+
+
+def backend_build(be,
                   cmake_script,
                   tag,
                   build_dir,
@@ -1516,27 +1675,45 @@ def build_backend(be,
                            library_paths, variant_index))
     cmake_script.makeinstall()
 
-    backend_install_dir = os.path.join(install_dir, 'backends', be)
-    cmake_script.rmdir(backend_install_dir)
-    cmake_script.mkdir(backend_install_dir)
+    cmake_script.mkdir(os.path.join(install_dir, 'backends'))
+    cmake_script.rmdir(os.path.join(install_dir, 'backends', be))
     cmake_script.cpdir(os.path.join(repo_install_dir, 'backends', be),
-                       backend_install_dir)
+                       os.path.join(install_dir, 'backends'))
     cmake_script.comment()
     cmake_script.comment(f'end \'{be}\' backend')
     cmake_script.commentln(8)
     cmake_script.blankln()
 
 
-def get_tagged_backend(be, version):
-    tagged_be = be
-    if be == 'openvino':
-        if version[0] == 'SPECIFIC':
-            tagged_be += "_" + version[1]
-        else:
-            tagged_be += "_" + version[0].replace('.', '_')
-            if version[1] and target_platform() != 'windows':
-                tagged_be += "_pre"
-    return tagged_be
+def repo_agent_build(ra, cmake_script, build_dir, install_dir, repoagent_repo,
+                     repoagents):
+    repo_build_dir = os.path.join(FLAGS.build_dir, ra, 'build')
+    repo_install_dir = os.path.join(FLAGS.build_dir, ra, 'install')
+
+    cmake_script.commentln(8)
+    cmake_script.comment(f'\'{ra}\' repository agent')
+    cmake_script.comment(
+        'Delete this section to remove repository agent from build')
+    cmake_script.comment()
+    cmake_script.mkdir(FLAGS.build_dir)
+    cmake_script.cwd(FLAGS.build_dir)
+    cmake_script.gitclone(repoagent_repo(ra), repoagents[ra], ra,
+                          FLAGS.github_organization)
+
+    cmake_script.mkdir(repo_build_dir)
+    cmake_script.cwd(repo_build_dir)
+    cmake_script.cmake(
+        repoagent_cmake_args(images, components, ra, repo_install_dir))
+    cmake_script.makeinstall()
+
+    cmake_script.mkdir(os.path.join(install_dir, 'repoagents'))
+    cmake_script.rmdir(os.path.join(install_dir, 'repoagents', ra))
+    cmake_script.cpdir(os.path.join(repo_install_dir, 'repoagents', ra),
+                       os.path.join(install_dir, 'repoagents'))
+    cmake_script.comment()
+    cmake_script.comment(f'end \'{ra}\' repository agent')
+    cmake_script.commentln(8)
+    cmake_script.blankln()
 
 
 if __name__ == '__main__':
@@ -1621,8 +1798,7 @@ if __name__ == '__main__':
         required=False,
         default='/tmp',
         help=
-        'Temporary parent directory used for building inside docker. Default is /tmp.'
-    )
+        'Temporary directory used for building inside docker. Default is /tmp.')
     parser.add_argument(
         '--library-paths',
         action='append',
@@ -1841,18 +2017,28 @@ if __name__ == '__main__':
     if FLAGS.extra_backend_cmake_arg is None:
         FLAGS.extra_backend_cmake_arg = []
 
+    # When doing a docker build, the build-dir must be a subdir within
+    # the server/ repo that contains this build.py script. This is
+    # necessary so that the build-dir gets copied into the
+    # tritonserver_buildbase image.
+    if ((not FLAGS.no_container_build) and
+        (pathlib.Path(THIS_SCRIPT_DIR) not in pathlib.Path(
+            FLAGS.build_dir).parents)):
+        fail('container build requires that --build-dir be a sub-directory ' +
+             'of the directory containing this build.py script')
+
     if FLAGS.install_dir is None:
         FLAGS.install_dir = os.path.join(FLAGS.build_dir, "opt", "tritonserver")
 
     # FLAGS.cmake_dir defaults to the directory containing build.py.
     if FLAGS.cmake_dir is None:
-        from inspect import getsourcefile
-        FLAGS.cmake_dir = SCRIPT_DIR
+        FLAGS.cmake_dir = THIS_SCRIPT_DIR
 
     # Determine the versions. Start with Triton version, if --version
     # is not explicitly specified read from TRITON_VERSION file.
     if FLAGS.version is None:
-        with open(os.path.join(SCRIPT_DIR, 'TRITON_VERSION'), "r") as vfile:
+        with open(os.path.join(THIS_SCRIPT_DIR, 'TRITON_VERSION'),
+                  "r") as vfile:
             FLAGS.version = vfile.readline().strip()
 
     if FLAGS.build_parallel is None:
@@ -1885,7 +2071,7 @@ if __name__ == '__main__':
     # For other versions use the TRITON_VERSION_MAP unless explicitly
     # given.
     if not FLAGS.no_container_build:
-        FLAGS.container_version, FLAGS.upstream_container_version = get_container_versions(
+        FLAGS.container_version, FLAGS.upstream_container_version = container_versions(
             FLAGS.version, FLAGS.container_version,
             FLAGS.upstream_container_version)
 
@@ -1990,14 +2176,6 @@ if __name__ == '__main__':
             OVERRIDE_BACKEND_CMAKE_FLAGS[be] = {}
         OVERRIDE_BACKEND_CMAKE_FLAGS[be][parts[0]] = parts[1]
 
-    # If --container-build is specified then we perform the actual
-    # build within a build container and then from that create a
-    # tritonserver container holding the results of the build.
-    if not FLAGS.no_container_build:
-        import docker
-        container_build(images, backends, repoagents, FLAGS.endpoint)
-        sys.exit(0)
-
     # If there is a container pre-build command assume this invocation
     # is being done within the build container and so run the
     # pre-build command.
@@ -2025,35 +2203,16 @@ if __name__ == '__main__':
         log('component "{}" at tag/branch "{}"'.format(c, components[c]))
 
     # Write the build script that invokes cmake for the core, backends, and repo-agents.
+    pathlib.Path(FLAGS.build_dir).mkdir(parents=True, exist_ok=True)
     with BuildScript(
-            os.path.join(FLAGS.build_dir, 'cmake_script'),
+            os.path.join(FLAGS.build_dir, CMAKE_SCRIPT_NAME),
             verbose=FLAGS.verbose,
             desc=('Build script for Triton Inference Server')) as cmake_script:
 
         # Commands to build the core shared library and the server executable.
         if not FLAGS.no_core_build:
-            repo_build_dir = os.path.join(FLAGS.build_dir, 'tritonserver',
-                                          'build')
-            repo_install_dir = os.path.join(FLAGS.build_dir, 'tritonserver',
-                                            'install')
-
-            cmake_script.commentln(8)
-            cmake_script.comment(
-                'Triton core library and tritonserver executable')
-            cmake_script.comment()
-            cmake_script.mkdir(repo_build_dir)
-            cmake_script.cwd(repo_build_dir)
-            cmake_script.cmake(
-                core_cmake_args(components, backends, repo_install_dir))
-            cmake_script.makeinstall()
-
-            core_install_dir = FLAGS.install_dir
-            cmake_script.mkdir(core_install_dir)
-            cmake_script.cpdir(repo_install_dir, core_install_dir)
-            cmake_script.comment()
-            cmake_script.comment('end Triton core library and tritonserver executable')
-            cmake_script.commentln(8)
-            cmake_script.blankln()
+            core_build(cmake_script, FLAGS.build_dir, FLAGS.install_dir,
+                       components, backends)
 
         # Commands to build each backend...
         for be in backends:
@@ -2064,13 +2223,12 @@ if __name__ == '__main__':
             tagged_be_list = []
             if (be == 'openvino'):
                 tagged_be_list.append(
-                    get_tagged_backend(be,
-                                       TRITON_VERSION_MAP[FLAGS.version][4][0]))
+                    tagged_backend(be, TRITON_VERSION_MAP[FLAGS.version][4][0]))
                 if (FLAGS.build_multiple_openvino):
                     skip = True
                     for ver in TRITON_VERSION_MAP[FLAGS.version][4]:
                         if not skip:
-                            tagged_be_list.append(get_tagged_backend(be, ver))
+                            tagged_be_list.append(tagged_backend(be, ver))
                         skip = False
 
             # If armnn_tflite backend, source from external repo for git clone
@@ -2080,13 +2238,13 @@ if __name__ == '__main__':
                 github_organization = FLAGS.github_organization
 
             if not tagged_be_list:
-                build_backend(be, cmake_script, backends[be], FLAGS.build_dir,
+                backend_build(be, cmake_script, backends[be], FLAGS.build_dir,
                               FLAGS.install_dir, github_organization, images,
                               components, library_paths)
             else:
                 variant_index = 0
                 for tagged_be in tagged_be_list:
-                    build_backend(tagged_be, cmake_script, backends[be],
+                    backend_build(tagged_be, cmake_script, backends[be],
                                   FLAGS.build_dir, FLAGS.install_dir,
                                   github_organization, images, components,
                                   library_paths, variant_index)
@@ -2094,38 +2252,28 @@ if __name__ == '__main__':
 
         # Commands to build each repo agent...
         for ra in repoagents:
-            repo_build_dir = os.path.join(FLAGS.build_dir, ra, 'build')
-            repo_install_dir = os.path.join(FLAGS.build_dir, ra, 'install')
+            repo_agent_build(ra, cmake_script, FLAGS.build_dir,
+                             FLAGS.install_dir, repoagent_repo, repoagents)
 
-            cmake_script.commentln(8)
-            cmake_script.comment(f'\'{ra}\' repository agent')
-            cmake_script.comment(
-                'Delete this section to remove repository agent from build')
-            cmake_script.comment()
-            cmake_script.mkdir(FLAGS.build_dir)
-            cmake_script.cwd(FLAGS.build_dir)
-            cmake_script.gitclone(repoagent_repo(ra), repoagents[ra], ra,
-                                  FLAGS.github_organization)
+    # If --container-build is specified then we perform the actual
+    # build within a docker container and from that create the final
+    # tritonserver docker image. For the build we need to generate a
+    # few Dockerfiles and a top-level DOCKER_SCRIPT_NAME script that
+    # drives the build process.
+    if not FLAGS.no_container_build:
+        create_build_dockerfiles(images, backends, repoagents, FLAGS.endpoint)
+        create_docker_build_script()
 
-            cmake_script.mkdir(repo_build_dir)
-            cmake_script.cwd(repo_build_dir)
-            cmake_script.cmake(
-                repoagent_cmake_args(images, components, ra, repo_install_dir))
-            cmake_script.makeinstall()
-
-            repoagent_install_dir = os.path.join(FLAGS.install_dir,
-                                                 'repoagents', ra)
-            cmake_script.rmdir(repoagent_install_dir)
-            cmake_script.mkdir(repoagent_install_dir)
-            cmake_script.cpdir(os.path.join(repo_install_dir, 'repoagents', ra),
-                               repoagent_install_dir)
-            cmake_script.comment()
-            cmake_script.comment(f'end \'{ra}\' repository agent')
-            cmake_script.commentln(8)
-            cmake_script.blankln()
-
-    # In not dry-run, execute the script to perform the build...
+    # In not dry-run, execute the script to perform the build...  If a
+    # container-based build is requested use 'docker_build' script,
+    # otherwise build directly on this system using CMAKE_SCRIPT_NAME
+    # script.
     if not FLAGS.dryrun:
-        p = subprocess.Popen(['./cmake_script'], cwd=FLAGS.build_dir)
+        if FLAGS.no_container_build:
+            script_name = CMAKE_SCRIPT_NAME
+        else:
+            script_name = DOCKER_SCRIPT_NAME
+
+        p = subprocess.Popen([f'./{script_name}'], cwd=FLAGS.build_dir)
         p.wait()
         fail_if(p.returncode != 0, 'build failed')
